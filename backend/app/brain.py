@@ -1,0 +1,1001 @@
+"""
+Decides HOW to answer a task:
+  simple       -> 1 LLM
+  medium       -> 2 LLMs, judged
+  complex      -> 3 LLMs, judged
+  very_complex -> orchestrator mode (loop engineering)
+
+Ruk can always override with plain language ("use only gemini",
+"start orchestrator mode") — that's parsed in main.py and passed in
+here as `override`, which always wins over auto-classification.
+
+Orchestration shape (Part 6 conformance, verified against _orchestrate
+2026-08-26 — this docstring is the contract):
+
+    Research  -> Gemini researches multiple angles BEFORE planning
+    Plan      -> 2-4 concrete sub-tasks, each with its research slice
+    Dispatch  -> workers execute in parallel (ThreadPoolExecutor)
+    HARD BARRIER -> orch_barrier_map: NO new work until EVERY worker
+                 of the round has returned (or the stall watchdog cuts
+                 the round loose with best-so-far)
+    Review    -> per-worker self-check (_self_check_output), THEN one
+                 orchestrator pass reviewing ALL outputs together,
+                 specifically hunting CONFLICTS between workers
+    Combine   -> conflicts surfaced/arbitrated, gaps become next round's
+                 sub-tasks; research IS allowed mid-run (review step can
+                 request one targeted extra search per round)
+
+Rounds repeat up to MAX_ORCHESTRATOR_ROUNDS; every LLM call in every
+phase flows through _counted/_call_guarded so MAX_ORCH_CALLS is a true
+per-request ceiling, and each return doubles as the stall watchdog's
+progress heartbeat.
+"""
+import ast
+import concurrent.futures
+import json
+import os
+import re
+import threading
+import time
+
+from app import llm, mastery
+from app.identity import SANDY_SYSTEM_PROMPT
+from app.llm import (
+    CapExceeded,
+    MODELS,
+    call_llm,
+    call_llm_with_fallback,
+    log,
+    strip_fence,
+    strip_json_fence,
+)
+
+_IDENTITY_MSG = {"role": "system", "content": SANDY_SYSTEM_PROMPT}
+
+# scode: the judge/verdict calls below never speak to Ruk — their output
+# is an internal merge/arbitration of other models' answers. Attaching the
+# full ~2.7k-token identity prompt to them bought zero personality (their
+# output replaces worker prose only after re-framing) at full price every
+# medium+ message. A one-line role instruction is all these calls need.
+_MERGE_MSG = {
+    "role": "system",
+    "content": (
+        "You arbitrate between multiple AI model answers to one task. "
+        "Output only the final merged answer, in a warm, natural, helpful voice."
+    ),
+}
+
+_HISTORY_FRAME = {
+    "role": "system",
+    "content": (
+        "The messages below (if any) are RECENT CONVERSATION HISTORY, for "
+        "background only. The actual question to answer is the LAST "
+        "message, sent just now. Do not confuse an old topic in this "
+        "history with the current question — if unsure what's being "
+        "asked, ask Ruk to clarify rather than guessing or answering "
+        "something from earlier in the history."
+    ),
+}
+
+
+HISTORY_WINDOW = 10  # last N messages (~5 user/assistant turns), not the raw 30
+# main.py fetches. scode: real, measured problem -- 30 raw messages were
+# getting attached to EVERY call in a tier (2-3x for medium/complex, and
+# for _orchestrate specifically -- plan call + every worker + every gap-
+# round worker, sometimes 8-15+ real calls for one user turn), each one
+# repeating the identical block. Confirmed by current (2026) production
+# guidance too: "the orchestrator accumulates context from every worker
+# -- at 4+ workers this frequently exceeds window limits." 5 turns is
+# enough for real immediate context (a follow-up referencing 2-3
+# messages back still works); anything older than that is what Mem0
+# (long-term recall) already exists to handle -- keeping a huge window
+# "just in case" would just reintroduce the exact bloat this fixes.
+# Scoped ONLY to what gets sent to the LLM -- main.py's own
+# chatlog.get_history(limit=30) for the /history UI endpoint is
+# untouched, Ruk still sees his full real chat log either way.
+
+
+def _with_history(history: list[dict] | None) -> list[dict]:
+    """Wraps history with clear framing so it can't get mistaken for the
+    current question. Empty list if there's no history to frame. Only
+    the last HISTORY_WINDOW messages — see the module-level comment
+    above for the real, measured reason."""
+    if not history:
+        return []
+    trimmed = history[-HISTORY_WINDOW:]
+    return [_HISTORY_FRAME] + trimmed
+
+TIERS = {
+    "simple": ["groq"],
+    "medium": ["groq", "gemini"],
+    "complex": ["groq", "gemini", "cerebras"],
+}
+MAX_ORCHESTRATOR_ROUNDS = 3  # ponytail: hard stop so a bad loop can't burn the whole day's cap
+MAX_ORCH_CALLS = 16          # scode: per-request ceiling on TOTAL orchestrator LLM calls
+
+# --- Part 6 stall watchdog -----------------------------------------------
+# One orchestration effectively runs at a time (it IS the chat reply), so a
+# single module-level record suffices. Every LLM RETURN inside _orchestrate
+# passes through _counted/_call_guarded, which stamp last_progress_at; a
+# barrier that sees no progress for orch_stall_seconds (sandy_config key
+# "orch_stall_seconds", env ORCH_STALL_SECONDS, default 180) releases with
+# best-so-far instead of hanging forever. Each run stamps the clock afresh
+# at entry, so a crashed predecessor can never poison the next run -- that
+# is why there is no explicit teardown at the many return sites.
+_ORCH = {"task": None, "started_at": 0.0, "last_progress_at": 0.0}
+_orch_lock = threading.Lock()
+
+
+def _orch_note_start(task: str) -> None:
+    now = time.time()
+    with _orch_lock:
+        _ORCH.update(task=(task or "")[:80], started_at=now, last_progress_at=now)
+
+
+def _orch_note_progress() -> None:
+    with _orch_lock:
+        _ORCH["last_progress_at"] = time.time()
+
+
+def orch_stalled_for() -> float:
+    """Seconds since the last orchestrator LLM return (0.0 when idle --
+    idle means no active run, so nothing can be 'stalled')."""
+    with _orch_lock:
+        if not _ORCH["task"]:
+            return 0.0
+        return max(0.0, time.time() - _ORCH["last_progress_at"])
+
+
+def _stall_seconds() -> float:
+    raw = None
+    try:
+        from app import config  # deferred: brain stays importable with no Supabase env
+
+        raw = config.get_config("orch_stall_seconds")
+    except Exception:
+        pass
+    if raw is None:
+        raw = os.environ.get("ORCH_STALL_SECONDS")
+    try:
+        return float(raw) if raw is not None else 180.0
+    except (TypeError, ValueError):
+        return 180.0
+
+
+def orch_barrier_map(pool, fn, items, *, what: str, on_event=None):
+    """The hard barrier, made interruptible. Preserves pool.map order
+    (results line up with `items`) -- but a round whose workers stop
+    making progress for _stall_seconds() can no longer hold the whole
+    orchestration hostage: finished sub-task results are kept as-is,
+    stuck slots are filled with an explicit watchdog note, ONE critical
+    alert fires, and the pipeline continues with best-so-far (same
+    graceful-degrade spirit as the all-providers-failed path).
+
+    Design honesty: the watchdog polls HERE, inside the waiting thread,
+    because a thread blocked in pool.map cannot be unblocked from
+    outside. Workers still running at release keep going until
+    llm.LLM_TIMEOUT_S bounds their HTTP call, then die inside
+    _run_subtask/_run_gap's own error handling; the executor's context
+    exit joins them, so the post-release wait is bounded (~one timeout),
+    not infinite. LLM_TIMEOUT_S (90s) sits well under the default stall
+    threshold (180s) so the watchdog stays a rare backstop, not the norm."""
+    futures = [pool.submit(fn, item) for item in items]
+    while True:
+        if all(f.done() for f in futures):
+            return [f.result() for f in futures]
+        if orch_stalled_for() > _stall_seconds():
+            for f in futures:
+                f.cancel()  # only cancels not-yet-started work; running threads expire via LLM_TIMEOUT_S
+            done_n = sum(1 for f in futures if f.done())
+            out = [
+                f.result() if f.done()
+                else "(this sub-task was cut loose by the stall watchdog -- "
+                     "providers stopped responding; best-so-far returned)"
+                for f in futures
+            ]
+            body = (
+                f"Orchestration '{_ORCH.get('task') or 'run'}' had no LLM progress for "
+                f"{int(orch_stalled_for())}s during {what}; released the barrier with "
+                f"{done_n}/{len(futures)} sub-tasks finished."
+            )
+            log(f"[brain.stall-watchdog] {body}")
+            if on_event:
+                try:
+                    on_event("obstacle", body, 0, None, None)
+                except Exception as e:
+                    log(f"[brain.stall-watchdog] on_event hook failed, continuing: {e!r}")
+            try:
+                from app import notify  # deferred: circular-import avoidance (projects.py precedent)
+
+                notify.alert("Sandy orchestration stalled", body, severity="critical")
+            except Exception as e:
+                log(f"[brain.stall-watchdog] alert failed (non-fatal): {e!r}")
+            return out
+        time.sleep(1.0)
+                             # (plan + workers + reviews + replans + gap rounds). A task that's
+                             # genuinely progressing finishes well under this; hitting it means
+                             # the loop is stuck repeating itself -- degrade to best-so-far
+                             # instead of letting one message eat the day's quota. Tighter,
+                             # request-scoped sibling of MAX_ORCHESTRATOR_ROUNDS.
+MAX_RESEARCH_QUERIES = 5  # cap on Gemini's own multi-angle research pass -- "deep research"
+                          # must not mean "silently burn the whole day's quota on one message"
+MAX_WORKER_RESEARCH = 1   # each worker gets at most one extra targeted search of its own,
+                          # on top of whatever research Gemini already handed it
+RESEARCH_CACHE_TTL = 3600  # 1 hour -- long enough for a follow-up question in the same
+                           # running session, short enough to never serve stale info. Plain
+                           # in-memory dict, not Supabase: this doesn't need to survive a
+                           # rebuild, it just needs to save a repeat search minutes apart --
+                           # a DB round trip on every single query to maybe save one repeat
+                           # occasionally isn't worth the added latency on every call.
+_research_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_CONFIDENCE_RE = re.compile(r"\n?CONFIDENCE:\s*(\d{1,2})\s*/\s*10\s*\(?([^)\n]*)\)?\s*$", re.IGNORECASE)
+_CONFIDENCE_INSTRUCTION = (
+    "\n\nEnd your answer with a new final line, exactly: "
+    "CONFIDENCE: X/10 (one short reason) -- your own honest rating of how "
+    "sure you are this is correct/complete."
+)
+
+
+def classify_complexity(task: str) -> str:
+    prompt = (
+        "Classify this task's difficulty as exactly one word: "
+        "simple, medium, complex, or very_complex.\n"
+        f"Task: {task}\nAnswer with one word only."
+    )
+    result = call_llm_with_fallback("groq", [{"role": "user", "content": prompt}], caller="brain.classify_complexity").strip().lower()
+    return result if result in {"simple", "medium", "complex", "very_complex"} else "medium"
+
+
+def _cached_search(query: str, provider: str | None = None) -> list[dict]:
+    """Same search.search(), but skips a repeat network call if the
+    exact same (query, provider) was searched within the last
+    RESEARCH_CACHE_TTL seconds -- real savings when Ruk asks a follow-up
+    close to something already researched.
+
+    Day 2 of the rebuild: search.py isn't in the repo yet (Day 4), so
+    this returns an empty list rather than crashing when called early.
+    The orchestrator still works end-to-end without research — research
+    is a quality boost, not a required dependency."""
+    key = (query.lower().strip(), provider or "")
+    cached = _research_cache.get(key)
+    if cached and time.time() - cached[0] < RESEARCH_CACHE_TTL:
+        return cached[1]
+    try:
+        from app import search  # deferred: not in this build yet
+    except Exception:
+        return []
+    try:
+        results = search.search(query, provider=provider) if provider else search.search(query)
+    except Exception as e:
+        log(f"[brain._cached_search] search not available yet, returning empty: {e!r}")
+        return []
+    _research_cache[key] = (time.time(), results)
+    return results
+
+
+_SKILL_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
+    "build", "make", "create", "add", "fix", "sandy", "this", "that", "it",
+}
+
+
+def _find_relevant_skill(task: str) -> str:
+    """Checks Sandy's own mastery jobs (real Hermes cron jobs, not a new
+    system) for anything relevant to this task -- if she's already spent
+    real time mastering something in this territory, that's a head
+    start worth using instead of researching from zero again, same
+    instinct as the original vision's 'second time is faster because
+    she already learned it.' Keyword overlap only, no LLM call -- this
+    is a cheap pre-check, not another classifier. Best-effort: any
+    failure here just means no head start, never blocks research."""
+    try:
+        jobs = mastery.list_mastery_jobs()
+    except Exception as e:
+        log(f"[brain._find_relevant_skill] job list failed, skipping: {e!r}")
+        return ""
+    task_words = set(re.findall(r"\w+", task.lower())) - _SKILL_STOPWORDS
+    best, best_overlap = None, 0
+    for job in jobs:
+        job_text = (job.get("name", "") + " " + job.get("prompt", "")).lower()
+        job_words = set(re.findall(r"\w+", job_text)) - _SKILL_STOPWORDS
+        overlap = len(task_words & job_words)
+        if overlap > best_overlap:
+            best, best_overlap = job, overlap
+    if best and best_overlap >= 2:  # require real overlap, not one common word matching
+        return (
+            f"Sandy already has a mastery skill in progress/completed: "
+            f"'{best.get('name', 'unnamed')}' (state: {best.get('state', 'unknown')}). "
+            "Treat this as a head start -- don't re-research territory she's already covered."
+        )
+    return ""
+
+
+def _extract_confidence(text: str) -> tuple[str, int | None, str]:
+    """Pulls a trailing 'CONFIDENCE: X/10 (reason)' line off an answer,
+    returns (clean_answer, confidence_or_None, reason). Confidence is
+    optional -- if a provider ignores the instruction and doesn't
+    include one, this just returns None, never breaks anything."""
+    m = _CONFIDENCE_RE.search(text.strip())
+    if not m:
+        return text, None, ""
+    clean = text[: m.start()].rstrip()
+    try:
+        conf = max(0, min(10, int(m.group(1))))
+    except ValueError:
+        return text, None, ""
+    return clean, conf, m.group(2).strip()
+
+
+def _extract_code_blocks(text: str) -> list[str]:
+    return re.findall(r"```(?:python|py)?\n(.*?)```", text, re.DOTALL)
+
+
+def _self_check_output(worker: str, sub_task: str, output: str, count_fn=None) -> str:
+    """Best-effort correctness pass before a worker's output is trusted.
+    Python code blocks get a real ast.parse() syntax check -- same
+    instinct as selfmod.py's pre-push validation, generalized here to
+    anything the orchestrator builds, not just self-edits. Anything else
+    gets one review pass asking specifically for bugs/logic errors.
+    Never blocks or loses work on failure -- if the check itself breaks,
+    the original output comes back unchanged."""
+    code_blocks = _extract_code_blocks(output)
+    if code_blocks:
+        for block in code_blocks:
+            try:
+                ast.parse(block)
+            except SyntaxError as e:
+                fix_prompt = (
+                    f"This Python code has a syntax error (line {e.lineno}: {e.msg}):\n\n"
+                    f"{block}\n\nFix it. Return ONLY the corrected code, no explanation, no fences."
+                )
+                try:
+                    if count_fn is not None:
+                        fixed = count_fn(worker, [{"role": "user", "content": fix_prompt}], caller="brain.self_check.fix_syntax")
+                    else:
+                        fixed = call_llm_with_fallback(worker, [{"role": "user", "content": fix_prompt}], caller="brain.self_check.fix_syntax")
+                    output = output.replace(block, strip_fence(fixed))
+                except Exception as e2:
+                    log(f"[brain._self_check_output] fix attempt failed, returning as-is: {e2!r}")
+        return output
+    # No fenced code found -- one general bug/logic-error review pass.
+    try:
+        review_prompt = (
+            f"Sub-task: {sub_task}\n\nOutput:\n{output}\n\n"
+            "Does this have any obvious bugs, logic errors, or mistakes? If "
+            "yes, return the corrected version. If no, return it EXACTLY "
+            "unchanged. Output ONLY the (possibly corrected) content, no "
+            "commentary, no preamble."
+        )
+        if count_fn is not None:
+            return count_fn(worker, [{"role": "user", "content": review_prompt}], caller="brain.self_check.review")
+        return call_llm_with_fallback(worker, [{"role": "user", "content": review_prompt}], caller="brain.self_check.review")
+    except Exception as e:
+        log(f"[brain._self_check_output] review failed, returning original: {e!r}")
+        return output
+
+
+def _research_log_summary(research_log: list[dict]) -> str:
+    """Turns the raw list of every search attempt this run into a short
+    report for the review step: which tool actually worked vs failed,
+    and whether the same (or near-same) query got run more than once by
+    different sources -- wasted calls, not real extra research."""
+    if not research_log:
+        return ""
+    lines = [f"- \"{r['query']}\" via {r['provider']} ({'ok' if r['ok'] else 'FAILED'}, by {r['source']})" for r in research_log]
+    seen: dict[str, list[str]] = {}
+    for r in research_log:
+        key = r["query"].strip().lower()
+        seen.setdefault(key, []).append(r["source"])
+    dupes = [f"\"{q}\" searched by both {', '.join(sources)}" for q, sources in seen.items() if len(sources) > 1]
+    summary = "\n\nResearch tools used this run:\n" + "\n".join(lines)
+    if dupes:
+        summary += "\n\nPossible duplicate research (wasted calls, not extra insight): " + "; ".join(dupes)
+    return summary
+
+
+_JACCARD_THRESHOLD = 0.75
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _answer_tokens(text: str) -> set[str]:
+    """Lowercased word tokens of an answer, with pure filler stripped --
+    'um', 'well', 'hey' etc. openers shouldn't make two semantically
+    identical answers look different (or two boilerplate-only replies look
+    identical). Greeting/small-talk answers are short enough that raw
+    token overlap is noisy without this."""
+    filler = {"um", "uh", "well", "so", "hey", "hi", "hello", "haha", "okay", "ok", "just", "really", "actually"}
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in filler}
+
+
+def _find_agreement(answers: dict[str, str], confidences: dict[str, tuple[int | None, str]] | None) -> str | None:
+    """If >=2 answers substantially agree, return the highest-confidence
+    one of them; else None (-> real disagreement -> judge earns its call)."""
+    names = list(answers)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = _answer_tokens(answers[names[i]]), _answer_tokens(answers[names[j]])
+            if not a or not b:
+                continue
+            jac = len(a & b) / len(a | b)
+            if jac > _JACCARD_THRESHOLD:
+                pair = [names[i], names[j]]
+                if confidences:
+                    best = max(pair, key=lambda p: confidences.get(p, (None, ""))[0] if confidences.get(p, (None, ""))[0] is not None else -1)
+                else:
+                    best = pair[0]
+                return answers[best]
+    return None
+
+
+def _judge(task: str, answers: dict[str, str], confidences: dict[str, tuple[int | None, str]] | None = None) -> str:
+    """One LLM picks/merges the best answer out of several. If self-rated
+    confidence scores came through, the merge is told about them
+    explicitly instead of treating every answer as equally trustworthy."""
+    joined = "\n\n".join(f"[{name}]: {ans}" for name, ans in answers.items())
+    conf_note = ""
+    if confidences:
+        conf_lines = [
+            f"- {name}: {c}/10 ({reason})" if c is not None else f"- {name}: no confidence given"
+            for name, (c, reason) in confidences.items()
+        ]
+        conf_note = "\n\nSelf-rated confidence per model:\n" + "\n".join(conf_lines) + (
+            "\n\nWeigh the merge toward higher-confidence answers where they conflict, "
+            "but don't ignore a low-confidence answer if it's still clearly correct."
+        )
+    prompt = (
+        f"Task: {task}\n\nHere are answers from different models:\n{joined}{conf_note}\n\n"
+        "Write the single best final answer, merging the strongest parts. "
+        "The inputs may come from different models with different tones -- "
+        "normalize style/formatting so the final answer reads as one coherent voice. "
+        "Output only the final answer, no commentary."
+    )
+    return call_llm_with_fallback("gemini", [_MERGE_MSG, {"role": "user", "content": prompt}], caller="brain.judge")
+
+
+def _run_tier(task: str, providers: list[str], context: str, history: list[dict] | None = None) -> str:
+    task_content = (f"{context}\n\nTask: {task}" if context else task) + _CONFIDENCE_INSTRUCTION
+    messages = [_IDENTITY_MSG] + _with_history(history) + [{"role": "user", "content": task_content}]
+    answers = {}
+    confidences = {}
+    last_error = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        future_to_provider = {pool.submit(call_llm, p, messages, caller="brain.run_tier"): p for p in providers}
+        for future in concurrent.futures.as_completed(future_to_provider):
+            p = future_to_provider[future]
+            try:
+                raw = future.result()
+                clean, conf, reason = _extract_confidence(raw)
+                answers[p] = clean
+                confidences[p] = (conf, reason)
+            except CapExceeded:
+                continue  # ponytail: skip a capped provider, don't fail the whole task
+            except Exception as e:
+                # ponytail: a single broken/misconfigured provider (bad model
+                # name, outage, whatever) shouldn't sink the whole task if the
+                # others in this tier can still answer -- skip it, keep going.
+                log(f"[brain._run_tier] provider '{p}' failed, skipping: {e!r}")
+                last_error = e
+                continue
+    if not answers:
+        # scode: the tier pool is dead -- before declaring total failure,
+        # try the EXTENDED pool (every provider with a live key + closed
+        # breaker, role-matched first), ordered by remaining daily-cap
+        # headroom. This is the plan's exhaustion ladder: healthy -> warn
+        # -> exhausted -> extended pool -> graceful all-dead message.
+        for p in llm.extended_pool():
+            try:
+                raw = call_llm(p, messages, caller="brain.run_tier.extended_pool")
+                clean, _, _ = _extract_confidence(raw)
+                return clean
+            except Exception as e:
+                log(f"[brain._run_tier] extended-pool provider '{p}' also failed: {e!r}")
+                last_error = e
+        raise CapExceeded(str(last_error) if last_error else "all providers for this tier are capped")
+    if len(answers) == 1:
+        return next(iter(answers.values()))
+    # scode: if two or more models independently landed on substantially
+    # the same answer, there is no disagreement for a judge to arbitrate
+    # -- paying a full extra LLM call (~5k tok with the old identity, still
+    # ~2.3k without) to merge identical answers bought nothing. Normalized
+    # token-set Jaccard > 0.75 between any pair counts as agreement; the
+    # highest-confidence member of the agreeing pair goes straight out.
+    # Real disagreements (the actual judge use case) fall through untouched.
+    agreed = _find_agreement(answers, confidences)
+    if agreed is not None:
+        return agreed
+    try:
+        return _judge(task, answers, confidences)
+    except Exception as e:
+        # scode: real bug found live -- _judge() had ZERO exception
+        # handling, unlike every other call site in this file. The
+        # inputs here are already real, successful answers from other
+        # providers -- if the merge/synthesis call itself fails (e.g.
+        # Cerebras billing lapsed mid-cascade), that must never crash
+        # the whole response when perfectly good answers already exist.
+        # Falls back to the highest self-reported confidence answer,
+        # or just the first real answer if no confidence was given.
+        log(f"[brain._run_tier] _judge failed ({e!r}) -- returning the best individual answer instead of crashing")
+        if confidences:
+            best = max(confidences, key=lambda p: confidences[p][0] if confidences[p][0] is not None else -1)
+            if best in answers:
+                return answers[best]
+        return next(iter(answers.values()))
+
+
+def _research_queries(topic: str, angle: str = "", count_fn=None) -> list[str]:
+    """What different angles/approaches/tools/existing solutions should
+    be explored for this? Returns up to MAX_RESEARCH_QUERIES short search
+    queries. Fails safe to a single direct query if this call itself
+    fails or returns something unusable -- research is a quality boost,
+    never something that should block orchestration from proceeding.
+    count_fn: orchestrator's budget-counting wrapper -- when given, this
+    LLM call counts toward the per-request ceiling (a CapExceeded from it
+    lands in the same fail-safe fallback as any other failure)."""
+    prompt = (
+        f"For this task: {topic}\n"
+        + (f"Specifically for this part: {angle}\n" if angle else "")
+        + f"List up to {MAX_RESEARCH_QUERIES} short, genuinely DIFFERENT web "
+        "search queries that would help find the best ways to build/answer "
+        "this -- different tools, approaches, existing solutions/repos, "
+        "angles. Not near-duplicates of each other. "
+        'Reply JSON only: {"queries": ["...", "..."]}'
+    )
+    try:
+        if count_fn is not None:
+            raw = count_fn("gemini", [{"role": "user", "content": prompt}], caller="brain.research_queries")
+        else:
+            raw = call_llm_with_fallback("gemini", [{"role": "user", "content": prompt}], caller="brain.research_queries")
+        queries = json.loads(strip_json_fence(raw)).get("queries")
+        if isinstance(queries, list) and queries:
+            return [str(q) for q in queries][:MAX_RESEARCH_QUERIES]
+    except Exception as e:
+        log(f"[brain._research_queries] failed, falling back to one direct query: {e!r}")
+    return [topic]
+
+
+def _research(topic: str, angle: str = "", log_list: list[dict] | None = None, count_fn=None) -> str:
+    """Runs up to MAX_RESEARCH_QUERIES real searches across different
+    angles on a topic, returns a combined findings block. Deliberately
+    rotates across Tavily/Exa/Linkup instead of defaulting every query
+    to Tavily-first (search.search()'s own fallback chain) -- Ruk pays
+    for all three and they're genuinely different tools (Tavily fast/
+    cheap, Exa neural/conceptual, Linkup deep/structured), so actual
+    variety across a multi-angle research pass beats always reaching
+    for the same one and treating the other two as pure insurance.
+    Any individual search failing is just skipped, never raised.
+    log_list: if given, every attempt (query, provider, ok/fail) gets
+    appended -- lets the review step later check whether a tool was
+    actually working and whether work was duplicated, not just trust
+    that research silently happened correctly.
+
+    Day 2 of the rebuild: search.py and scraply.py aren't in the repo
+    yet (Day 4), so every individual search is currently a no-op.
+    Research degrades to "no extra findings" -- orchestration still
+    works, just with no web research pre-step."""
+    providers = ["linkup", "exa", "tavily"]  # deep-understanding query first, then conceptual, then fast
+    findings = []
+    for i, q in enumerate(_research_queries(topic, angle, count_fn=count_fn)):
+        provider = providers[i % len(providers)]
+        try:
+            results = _cached_search(q, provider)
+            block = "\n".join(f"- {r['title']}: {r['content'][:300]}" for r in results[:3])
+            if block:
+                # scraply follow-up: read the top result's actual page, not
+                # just the snippet -- one cheap fast-mode scrape per query,
+                # capped in scraply itself so token discipline holds.
+                try:
+                    from app import scraply
+                    pages = scraply.fetch_top(results[:3], n=1)
+                    if pages:
+                        block += f"\n\nFull page ({pages[0]['url']}):\n{pages[0]['markdown']}"
+                except Exception as se:
+                    log(f"[brain._research] scraply follow-up skipped: {se!r}")
+                findings.append(f"[{q} via {provider}]\n{block}")
+            if log_list is not None:
+                log_list.append({"query": q, "provider": provider, "source": "gemini-research", "ok": True})
+        except Exception as e:
+            log(f"[brain._research] search '{q}' via {provider} failed, skipping: {e!r}")
+            if log_list is not None:
+                log_list.append({"query": q, "provider": provider, "source": "gemini-research", "ok": False})
+    return "\n\n".join(findings)
+
+
+def _orchestrate(
+    task: str, context: str, history: list[dict] | None = None, on_event=None,
+    workers: list[str] | None = None, extra_workers: list[str] | None = None,
+    provider_guard=None, should_continue=None, orchestrator: str | None = None,
+) -> str:
+    """v3 (built after Ruk's refinement): Gemini researches multiple
+    angles FIRST (existing tools, approaches, repos), plans 2-4
+    sub-tasks with that research attached, workers each execute (and can
+    ask for one extra targeted search of their own on top of what
+    Gemini gave them) -- then instead of immediately handing out new
+    sub-tasks, Gemini reviews ALL worker output together, specifically
+    checking for CONFLICTS between workers (this is where real bugs
+    come from in multi-agent builds -- two workers independently
+    assuming different things about the same piece, not any one worker
+    being wrong), researches again only if something's genuinely
+    unresolved, and only then replans holistically for the next round.
+    Every step degrades gracefully -- a failure anywhere falls back to
+    the best available partial result, never an unhandled crash.
+
+    on_event(event_type, summary, round, provider=None, detail=None) --
+    optional hook, called at each real transition (research/planning/
+    worker-done/conflict/replan/synthesis). Used by native_mastery.py to
+    log real events for the orb graph. Default None -- normal chat use
+    (brain.answer) never sets this, so behavior/cost here is completely
+    unchanged for every existing caller.
+
+    workers -- optional custom round-robin worker list (e.g. weighted by
+    Ruk's per-run provider percentages for a native mastery run). Default
+    None keeps the original ["groq", "cerebras"] behavior exactly as
+    before -- existing chat callers are unaffected.
+
+    extra_workers -- optional models NOT in the normal rotation that only
+    get pulled in once a round needed real replanning (i.e. the task
+    turned out genuinely hard) -- native_mastery.py's "add more models if
+    the task is hard" behavior. Default None = never used, unchanged for
+    every existing caller.
+
+    provider_guard(provider) -> bool -- optional per-call check, used by
+    native_mastery.py to enforce Ruk's own per-JOB provider caps (on top
+    of, not instead of, llm.py's global daily cap). A provider failing
+    this check is skipped for that call, same as a capped/failed provider
+    already is. Default None = no extra check, unchanged for every
+    existing caller.
+
+    should_continue() -> bool -- optional pause check, polled once per
+    replan round (the only real checkpoint this loop has -- there's no
+    finer mid-round pause). Returns False -> stop and return the best
+    result so far instead of continuing to replan. Default None = never
+    stops early, unchanged for every existing caller.
+
+    orchestrator -- which provider runs the research/plan/review/replan
+    role. Was hardcoded to "gemini" regardless of what was passed in
+    here -- meaning a native mastery job configured to barely use
+    Gemini still burned up to ~8 Gemini calls per round on
+    orchestration alone (research + planning, then review + replan per
+    round, up to MAX_ORCHESTRATOR_ROUNDS). Default None -> "gemini",
+    so normal chat use (brain.answer, which never passes this) is
+    completely unchanged. native_mastery.py now passes the job's own
+    top-weighted real provider explicitly."""
+    def _emit(event_type, summary, round=0, provider=None, detail=None):
+        if on_event:
+            try:
+                on_event(event_type, summary, round, provider, detail)
+            except Exception as e:
+                log(f"[brain._orchestrate] on_event hook failed, continuing: {e!r}")
+
+    orchestrator = orchestrator or "gemini"
+    workers = workers or ["groq", "cerebras"]
+    extra_workers = extra_workers or []
+    _orch_note_start(task)  # stall-watchdog: fresh clock per run; a crashed predecessor can't poison this one
+
+    # scode: every LLM call this request makes goes through one of these
+    # two wrappers so the ceiling counts real calls, not rounds.
+    budget = {"n": 0}
+
+    def _budget_left() -> bool:
+        return budget["n"] < MAX_ORCH_CALLS
+
+    def _counted(provider: str, msgs: list[dict], caller: str):
+        if not _budget_left():
+            raise CapExceeded(f"orchestrator call budget ({MAX_ORCH_CALLS}) exhausted")
+        budget["n"] += 1
+        out = call_llm_with_fallback(provider, msgs, caller=caller)
+        _orch_note_progress()  # stall-watchdog heartbeat: an LLM RETURN is progress
+        return out
+
+    def _call_guarded(worker: str, msgs: list[dict]):
+        """call_llm, but skips straight to the orchestrator fallback if
+        provider_guard rejects `worker` -- same shape as a real provider
+        failure, so callers don't need a separate code path for it.
+        Counts toward the per-request call budget too."""
+        if not _budget_left():
+            raise CapExceeded(f"orchestrator call budget ({MAX_ORCH_CALLS}) exhausted")
+        if provider_guard is not None:
+            try:
+                if not provider_guard(worker):
+                    raise CapExceeded(f"{worker}: job-level cap reached")
+            except CapExceeded:
+                raise
+            except Exception as e:
+                log(f"[brain._orchestrate] provider_guard errored, treating as OK: {e!r}")
+        budget["n"] += 1
+        out = call_llm(worker, msgs, caller="brain.orchestrate.worker")
+        _orch_note_progress()  # stall-watchdog heartbeat
+        return out
+    research_log: list[dict] = []  # every search this run makes: query, provider, source, ok/fail --
+                                    # lets the review step check tools are actually working and
+                                    # workers aren't quietly duplicating each other's searches
+
+    skill_context = _find_relevant_skill(task)
+    research = _research(task, log_list=research_log, count_fn=_counted)
+    if skill_context:
+        research = f"{skill_context}\n\n{research}" if research else skill_context
+    _emit("planning", f"Research done ({len(research_log)} queries) -- planning sub-tasks", provider=orchestrator)
+    # scode: keep the round-1 research text around -- later replan rounds
+    # re-read it instead of the orchestrator re-researching the same ground.
+    research_head_start = research
+    plan_prompt = (
+        (f"{context}\n\n" if context else "")
+        + f"Task: {task}\n\nResearch findings:\n{research}\n\n"
+        "Using this research, break the task into 2-4 concrete sub-tasks "
+        "that, done well, complete it. For each sub-task, include the "
+        "specific slice of research it actually needs (not everything). "
+        'Return JSON only: {"subtasks": [{"task": "...", "notes": "..."}]}'
+    )
+    try:
+        plan_raw = _counted(orchestrator, [{"role": "user", "content": plan_prompt}], caller="brain.orchestrate.plan")
+        subtasks = json.loads(strip_json_fence(plan_raw))["subtasks"]
+        if not isinstance(subtasks, list) or not subtasks:
+            raise ValueError
+        subtasks = [s if isinstance(s, dict) else {"task": str(s), "notes": ""} for s in subtasks]
+    except Exception as e:
+        log(f"[brain._orchestrate] planning failed, treating as single task: {e!r}")
+        subtasks = [{"task": task, "notes": research}]
+    _emit("planning", f"{len(subtasks)} sub-task(s) planned", detail=str(subtasks))
+
+    def _worker_own_research(worker: str, sub_task: str, notes: str) -> str:
+        """One shot for the worker to ask for ONE more targeted search on
+        top of what Gemini already gave it -- filling a gap specific to
+        its own piece, not redoing Gemini's broader research. The worker
+        also picks which tool actually fits its need (fast fact-check vs
+        conceptual vs deep/structured), not just whatever the default
+        happens to be -- real agency over the tool, matching how a
+        person would actually pick a search engine for the question."""
+        try:
+            need_prompt = (
+                f"Sub-task: {sub_task}\nGiven research: {notes}\n\n"
+                "Do you need ONE more specific web search to do this well "
+                "(exact syntax, a specific tool's docs, etc)? If yes, also "
+                "pick whichever tool actually fits: 'tavily' (fast/quick "
+                "facts), 'exa' (conceptual/similar approaches), 'linkup' "
+                "(deep/structured). "
+                'Reply JSON only: {"query": "...", "provider": "tavily"} or {"query": null}'
+            )
+            need_raw = _counted(worker, [{"role": "user", "content": need_prompt}], caller="brain.orchestrate.worker_own_research")
+            need = json.loads(strip_json_fence(need_raw))
+            if need.get("query"):
+                provider = need.get("provider") if need.get("provider") in ("tavily", "exa", "linkup") else None
+                try:
+                    results = _cached_search(need["query"], provider)
+                    research_log.append({"query": need["query"], "provider": provider or "default", "source": worker, "ok": True})
+                    return "\n".join(f"- {r['title']}: {r['content'][:300]}" for r in results[:3])
+                except Exception as e:
+                    research_log.append({"query": need["query"], "provider": provider or "default", "source": worker, "ok": False})
+                    raise
+        except Exception as e:
+            log(f"[brain._orchestrate] worker '{worker}' own-research skipped: {e!r}")
+        return ""
+
+    def _run_subtask(i_sub):
+        i, sub = i_sub
+        worker = workers[i % len(workers)]
+        sub_task, notes = sub["task"], sub.get("notes", "")
+        extra = _worker_own_research(worker, sub_task, notes)
+        sub_with_context = (
+            (f"{context}\n\n" if context else "")
+            + f"Sub-task: {sub_task}\nResearch: {notes}"
+            + (f"\nAdditional research: {extra}" if extra else "")
+            + _CONFIDENCE_INSTRUCTION
+        )
+        msgs = [_IDENTITY_MSG] + _with_history(history) + [{"role": "user", "content": sub_with_context}]
+        try:
+            raw = _call_guarded(worker, msgs)
+        except Exception as e:
+            log(f"[brain._orchestrate] worker '{worker}' failed, trying orchestrator fallback: {e!r}")
+            # scode: zero-loss failover -- before giving up on this sub-task,
+            # walk the EXTENDED pool (healthy providers, role-matched first,
+            # most cap headroom first), skipping who already failed. Same
+            # subtask prompt goes to the replacement (nothing was lost --
+            # non-streaming means a dead provider never emitted a half
+            # answer); budget ceiling still applies to every attempt.
+            raw = None
+            for alt in llm.extended_pool():
+                if alt in (worker, orchestrator):
+                    continue
+                try:
+                    raw = _counted(alt, msgs, caller="brain.orchestrate.worker_replacement")
+                    log(f"[brain._orchestrate] sub-task rescued by extended-pool provider '{alt}'")
+                    break
+                except Exception as e2:
+                    log(f"[brain._orchestrate] replacement '{alt}' also failed: {e2!r}")
+            if raw is None:
+                try:
+                    raw = _counted(orchestrator, msgs, caller="brain.orchestrate.worker_fallback")
+                except Exception as e3:
+                    log(f"[brain._orchestrate] all providers failed sub-task '{sub_task[:60]}': {e3!r}")
+                    return f"(this sub-task could not be completed: {sub_task} -- all providers failed)", (None, "")
+        clean, conf, reason = _extract_confidence(raw)
+        checked = _self_check_output(worker, sub_task, clean, count_fn=_counted)
+        _emit("worker_call", f"{worker} finished sub-task: {sub_task[:80]}", provider=worker, detail=checked[:500])
+        return checked, (conf, reason)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(subtasks)) as pool:
+        subtask_out = orch_barrier_map(pool, _run_subtask, enumerate(subtasks), what="worker dispatch", on_event=on_event)
+    results = [r for r, _ in subtask_out]
+    confidences = {f"worker_{i}": c for i, (_, c) in enumerate(subtask_out)}
+
+    def _run_gap(sub_text: str, worker: str) -> str:
+        msgs = [_IDENTITY_MSG] + _with_history(history) + [{"role": "user", "content": sub_text}]
+        try:
+            raw = _call_guarded(worker, msgs)
+        except Exception as e:
+            log(f"[brain._orchestrate] gap worker '{worker}' failed, trying orchestrator fallback: {e!r}")
+            # scode: same extended-pool rescue as _run_subtask -- a capped or
+            # dead gap worker never kills the sub-task while any healthy
+            # provider remains (budget ceiling still applies per attempt).
+            raw = None
+            for alt in llm.extended_pool():
+                if alt in (worker, orchestrator):
+                    continue
+                try:
+                    raw = _counted(alt, msgs, caller="brain.orchestrate.gap_replacement")
+                    break
+                except Exception:
+                    continue
+            if raw is None:
+                try:
+                    raw = _counted(orchestrator, msgs, caller="brain.orchestrate.gap_fallback")
+                except Exception as e2:
+                    log(f"[brain._orchestrate] gap worker '{worker}' all providers failed: {e2!r}")
+                    return f"(gap sub-task could not be completed: {sub_text})"
+        return _self_check_output(worker, sub_text, raw, count_fn=_counted)
+
+    for _round in range(MAX_ORCHESTRATOR_ROUNDS):
+        # scode: graceful degrade -- out of call budget -> hand back the
+        # best result so far instead of pushing further rounds.
+        if not _budget_left():
+            _emit("obstacle", f"LLM call budget ({MAX_ORCH_CALLS}) reached -- keeping best result so far", round=_round, provider=orchestrator)
+            return "\n\n".join(results)
+        if should_continue is not None:
+            try:
+                if not should_continue():
+                    _emit("obstacle", "Paused by Ruk -- stopping here, best result so far kept", round=_round, provider=orchestrator)
+                    return results[-1]
+            except Exception as e:
+                log(f"[brain._orchestrate] should_continue check errored, continuing normally: {e!r}")
+        conf_note = ""
+        if confidences:
+            conf_lines = [
+                f"- {name}: {c}/10 ({reason})" if c is not None else f"- {name}: no confidence given"
+                for name, (c, reason) in confidences.items()
+            ]
+            conf_note = "\n\nSelf-rated confidence per worker:\n" + "\n".join(conf_lines)
+        review_prompt = (
+            (f"{context}\n\n" if context else "")
+            + f"Original task: {task}\n\nWorker outputs:\n"
+            + "\n".join(f"{i+1}. {r}" for i, r in enumerate(results))
+            + conf_note
+            + _research_log_summary(research_log)
+            + "\n\nReview this. Check specifically: (a) is this enough to "
+            "fully answer the original task, (b) do any worker outputs "
+            "CONFLICT with each other -- different assumptions, mismatched "
+            "approaches, inconsistent naming/structure between pieces that "
+            "are supposed to fit together. That's the most common real "
+            "source of bugs when separate workers build separate pieces. "
+            "(c) did any search tool actually fail this run -- if so, "
+            "consider whether the missing info matters enough to retry with "
+            "a different tool. (d) was research duplicated across workers "
+            "-- if so, note it as wasted effort, not a real problem to fix. "
+            "Low-confidence outputs deserve extra scrutiny here. "
+            'Reply JSON only: {"done": true, "answer": "..."} or '
+            '{"done": false, "conflicts": "...", "missing": "...", '
+            '"research_query": "..." or null, "research_provider": "tavily" or null}'
+        )
+        try:
+            verdict_raw = _counted(
+                orchestrator, [_MERGE_MSG] + _with_history(history) + [{"role": "user", "content": review_prompt}],
+                caller="brain.orchestrate.review",
+            )
+        except Exception as e:
+            log(f"[brain._orchestrate] review failed, returning raw results: {e!r}")
+            return "\n\n".join(results)
+        try:
+            verdict = json.loads(strip_json_fence(verdict_raw))
+        except json.JSONDecodeError:
+            return verdict_raw  # orchestrator didn't return JSON -> just use its text
+        if not isinstance(verdict, dict):
+            return verdict_raw
+        if verdict.get("done"):
+            _emit("synthesis", "Review found the work complete -- synthesizing final answer", round=_round, provider=orchestrator)
+            return verdict.get("answer") or results[-1]
+        if verdict.get("conflicts") and verdict["conflicts"].lower() not in ("none", "no", ""):
+            _emit("conflict", f"Conflict found between worker outputs: {verdict['conflicts'][:200]}", round=_round, provider=orchestrator, detail=verdict.get("conflicts"))
+
+        # Only research again if the review step actually asked for it --
+        # informed by what the workers produced, not a blind re-search.
+        # Uses whichever tool Gemini itself picked (research_provider),
+        # since by this point it's seen which tools worked/failed above.
+        extra_research = ""
+        if verdict.get("research_query"):
+            provider = verdict.get("research_provider") if verdict.get("research_provider") in ("tavily", "exa", "linkup") else None
+            try:
+                r = _cached_search(verdict["research_query"], provider)
+                extra_research = "\n".join(f"- {x['title']}: {x['content'][:300]}" for x in r[:3])
+                research_log.append({"query": verdict["research_query"], "provider": provider or "default", "source": "gemini-review", "ok": True})
+            except Exception as e:
+                log(f"[brain._orchestrate] round-{_round} research failed, skipping: {e!r}")
+                research_log.append({"query": verdict["research_query"], "provider": provider or "default", "source": "gemini-review", "ok": False})
+
+        replan_prompt = (
+            f"Original task: {task}\nWorker outputs so far:\n"
+            + "\n".join(f"{i+1}. {r}" for i, r in enumerate(results))
+            + f"\n\nConflicts found: {verdict.get('conflicts', 'none')}"
+            + f"\nStill missing: {verdict.get('missing', '')}"
+            + (f"\nNew research: {extra_research}" if extra_research else "")
+            + (f"\n\nResearch already gathered in round 1 -- reuse this instead of "
+               f"re-searching the same ground:\n{research_head_start[:1500]}"
+               if research_head_start else "")
+            + "\n\nGive the next concrete step(s) to fix/complete this, "
+            'holistically using everything above. JSON only: {"subtasks": ["...", "..."]}'
+        )
+        try:
+            replan_raw = _counted(orchestrator, [{"role": "user", "content": replan_prompt}], caller="brain.orchestrate.replan")
+            next_subtasks = json.loads(strip_json_fence(replan_raw))["subtasks"]
+            if not isinstance(next_subtasks, list) or not next_subtasks:
+                raise ValueError
+        except Exception as e:
+            log(f"[brain._orchestrate] replan failed, stopping loop early: {e!r}")
+            return results[-1]
+        # scode: task needed a genuine replan -- it's harder than the original
+        # worker set assumed. Gap workers now come from the EXTENDED pool
+        # (healthy providers, most cap headroom first, MODELS order as
+        # tiebreak) with extra_workers pinned to the front -- so a capped or
+        # dead core provider can't starve round 2+ while 12 others sit
+        # healthy. Normal chat callers see no change when everyone's
+        # healthy: groq/gemini/cerebras have top headroom + roles anyway.
+        _pool = llm.extended_pool()
+        gap_workers = [w for w in workers if w in set(_pool)] \
+            + [w for w in extra_workers if w not in workers] \
+            + [w for w in _pool if w not in workers and w not in extra_workers]
+        if not gap_workers:
+            gap_workers = workers or [orchestrator]
+        if extra_workers:
+            _emit("planning", f"Task needs more help -- adding {extra_workers} to the rotation this round", round=_round + 1, provider=orchestrator)
+        _emit("planning", f"Round {_round+1}: replanned with {len(next_subtasks)} gap sub-task(s)", round=_round + 1, provider=orchestrator)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(next_subtasks)) as pool:
+            gap_results = orch_barrier_map(
+                pool,
+                lambda i_s: _run_gap(str(i_s[1]), gap_workers[i_s[0] % len(gap_workers)]),
+                enumerate(next_subtasks),
+                what="gap round",
+                on_event=on_event,
+            )
+        results.extend(gap_results)
+
+    _emit("synthesis", "Ran out of rounds -- returning best-effort last result", provider=orchestrator)
+    return results[-1]  # ran out of rounds -> best-effort last result
+
+
+def answer(
+    task: str,
+    context: str = "",
+    override: list[str] | None = None,
+    history: list[dict] | None = None,
+    tier: str | None = None,
+) -> str:
+    """override: explicit provider list from Ruk (e.g. ["gemini"]), or
+    ["orchestrator"] to force orchestrator mode. None = auto-classify.
+    history: recent conversation turns (from chatlog), so every call
+    actually has short-term memory, not just long-term Mem0 facts.
+    tier: pass this in if the caller already ran classify_complexity()
+    for another reason (e.g. picking a search provider) -- skips a
+    second, redundant classification call for the same message."""
+    if override == ["orchestrator"]:
+        return _orchestrate(task, context, history)
+    if override:
+        return _run_tier(task, override, context, history)
+
+    tier = tier or classify_complexity(task)
+    if tier == "very_complex":
+        return _orchestrate(task, context, history)
+    return _run_tier(task, TIERS[tier], context, history)
+
+
+if __name__ == "__main__":
+    tier = classify_complexity("what's 2+2")
+    assert tier == "simple", f"expected simple, got {tier}"
+    print("brain.py: classify OK ->", tier)
